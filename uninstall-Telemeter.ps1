@@ -11,12 +11,13 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-# Native tools use documented exit codes, including nonzero idempotent results.
+# Native tools use documented exit codes, including nonzero idempotent results. 
 $PSNativeCommandUseErrorActionPreference = $false
-$legacyServiceNames = @("WinTelemetrySvc")
+$legacyServiceNames = @("WinTelemetrySvc", "MultiplatformRemoteBroker")
 $legacyTaskNames = @("WinTelemetrySvcMaintenance")
 $script:cleanupErrors = New-Object 'System.Collections.Generic.List[string]'
 $script:targetPaths = @()
+$script:serviceExecutables = @()
 $script:deleteRequested = @()
 $script:cleanupScriptPath = $PSCommandPath
 
@@ -121,6 +122,46 @@ function Get-LegacyTasks {
 	Get-ScheduledTask | Where-Object { $_.TaskName -in $legacyTaskNames }
 }
 
+function Get-ServiceExecutablePath {
+	param([string]$PathName)
+	if (-not $PathName) {
+		return $null
+	}
+	$trimmed = $PathName.Trim()
+	if ($trimmed.StartsWith('"')) {
+		# A quoted image path ends at the closing quote, before any arguments.
+		$end = $trimmed.IndexOf('"', 1)
+		if ($end -gt 1) {
+			return $trimmed.Substring(1, $end - 1)
+		}
+		return $null
+	}
+	# An unquoted image path ends at its ".exe" token, before any arguments.
+	$match = [regex]::Match($trimmed, '^(.*?\.exe)(?:\s|$)', 'IgnoreCase')
+	if ($match.Success) {
+		return $match.Groups[1].Value
+	}
+	return ($trimmed -split '\s+', 2)[0]
+}
+
+function Get-LegacyServiceExecutablePaths {
+	$paths = New-Object 'System.Collections.Generic.List[string]'
+	foreach ($name in $legacyServiceNames) {
+		Invoke-CleanupAction -Label "Inspecting service image for $name" -Action {
+			$svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'"
+			if ($svc -and $svc.PathName) {
+				$exe = Get-ServiceExecutablePath -PathName $svc.PathName
+				# Never target shared service hosts for termination.
+				$leaf = if ($exe) { ($exe -split '[\\/]')[-1] } else { $null }
+				if ($exe -and $leaf -notin @("svchost.exe", "dllhost.exe", "rundll32.exe")) {
+					$paths.Add($exe)
+				}
+			}
+		}
+	}
+	$paths | Sort-Object -Unique
+}
+
 function Get-LegacyProcesses {
 	foreach ($process in @(Get-CimInstance -ClassName Win32_Process)) {
 		$exe = $process.ExecutablePath
@@ -130,13 +171,25 @@ function Get-LegacyProcesses {
 			}
 			continue
 		}
+		$matched = $false
 		foreach ($path in $script:targetPaths) {
 			$prefix = $path.TrimEnd('\') + '\'
 			if ($exe.Equals($path, [StringComparison]::OrdinalIgnoreCase) -or
 				$exe.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
-				$process
+				$matched = $true
 				break
 			}
+		}
+		if (-not $matched) {
+			foreach ($serviceExe in $script:serviceExecutables) {
+				if ($exe.Equals($serviceExe, [StringComparison]::OrdinalIgnoreCase)) {
+					$matched = $true
+					break
+				}
+			}
+		}
+		if ($matched) {
+			$process
 		}
 	}
 }
@@ -399,6 +452,8 @@ function Ensure-PsExec {
 
 function Invoke-LegacyCleanupPass {
 	$script:targetPaths = @(Get-LegacyPaths | Sort-Object -Unique)
+	# Capture service image paths before deletion so stragglers can still be killed.
+	$script:serviceExecutables = @(Get-LegacyServiceExecutablePaths)
 	Invoke-CleanupAction -Label "Removing scheduled tasks" -Action { Remove-LegacyTasks }
 	Invoke-CleanupAction -Label "Removing services" -Action { Remove-LegacyServices }
 	Invoke-CleanupAction -Label "Stopping deployment processes" -Action { Stop-LegacyProcesses }
